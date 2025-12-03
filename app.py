@@ -1,4 +1,5 @@
-from fastapi import FastAPI, HTTPException, Query
+# app.py
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -8,26 +9,29 @@ import traceback
 import numpy as np
 import httpx
 import os
+import sys
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# Add CORS middleware to allow frontend to connect
-# Allow all origins for development (more permissive)
+# CORS - permissive for development
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins for development
-    allow_credentials=False,  # Must be False when allow_origins is ["*"]
+    allow_origins=["*"],  # tighten in production
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Exception handler to ensure CORS headers are always sent for unhandled exceptions
+# Global exception handler (keeps CORS headers)
 @app.exception_handler(Exception)
-async def global_exception_handler(request, exc):
+async def global_exception_handler(request: Request, exc: Exception):
     if isinstance(exc, HTTPException):
-        # Let FastAPI handle HTTPExceptions normally (CORS middleware will add headers)
         raise exc
-    # Handle other exceptions
+    logger.exception("Unhandled exception")
     return JSONResponse(
         status_code=500,
         content={"detail": str(exc)},
@@ -35,35 +39,58 @@ async def global_exception_handler(request, exc):
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "*",
             "Access-Control-Allow-Headers": "*",
-        }
+        },
     )
 
-# Load model - use absolute path based on this file's location
+# ---------- Model loading ----------
 model_path = Path(__file__).parent / "model.pkl"
-model = joblib.load(model_path)  # Pipeline: tfidf + LinearSVC
+if not model_path.exists():
+    logger.error("Model file not found at %s", model_path)
+    # Fail fast so Render build logs show the reason
+    raise FileNotFoundError(f"model.pkl not found at {model_path}")
 
-# Get class names from the model
-# The model is a pipeline, so we need to access the classifier step
-classifier = model.named_steps.get('clf') or model[-1]  # Get the classifier from pipeline
-class_names = getattr(classifier, 'classes_', None)
+try:
+    model = joblib.load(model_path)  # pipeline expected
+    logger.info("Loaded model from %s", model_path)
+except Exception as e:
+    logger.exception("Failed to load model.pkl")
+    raise
 
-# Create a mapping from numeric labels to class names
-# Update these names based on what your model actually classifies
-# Common examples: ['Negative', 'Positive'], ['Spam', 'Ham'], ['Fake', 'Real'], etc.
-LABEL_NAMES = {
-    0: "true",  # 0 means True (authentic news)
-    1: "false",  # 1 means False (fake/misinformation)
-}
+# Try to get classifier step (works for Pipeline or plain estimator)
+classifier = None
+class_names = None
 
-# If model has classes_, try to use them
-# Only overwrite if classes are already meaningful strings, not numeric
+# If pipeline-like with named_steps or steps, attempt multiple safe ways:
+try:
+    if hasattr(model, "named_steps"):
+        # Common name used by some pipelines: 'clf' or 'classifier'
+        classifier = model.named_steps.get("clf") or model.named_steps.get("classifier")
+        if classifier is None:
+            # fallback: last step in the pipeline
+            try:
+                classifier = list(model.named_steps.values())[-1]
+            except Exception:
+                classifier = None
+    elif hasattr(model, "steps"):
+        classifier = model.steps[-1][1]
+    else:
+        # model itself may be the classifier
+        classifier = model
+except Exception:
+    classifier = model  # last resort
+
+# Try to get class names if present (sklearn: classes_)
+if classifier is not None:
+    class_names = getattr(classifier, "classes_", None)
+
+# Fallback label names (adjust to your mapping if needed)
+LABEL_NAMES = {0: "true", 1: "false"}
 if class_names is not None and len(class_names) == 2:
-    # Check if classes are strings (not numeric)
-    if all(isinstance(c, str) or (hasattr(c, 'dtype') and np.issubdtype(c.dtype, np.str_)) for c in class_names):
-        # If classes are already strings, use them directly
+    # If classes are strings, use them; otherwise keep fallback mapping
+    if all(isinstance(c, str) for c in class_names):
         LABEL_NAMES = {i: str(class_names[i]) for i in range(len(class_names))}
-    # Otherwise, keep the LABEL_NAMES mapping we defined above
 
+# ---------- Request models ----------
 class RequestModel(BaseModel):
     text: str
 
@@ -71,119 +98,96 @@ class RequestModel(BaseModel):
 def root():
     return {"message": "Sachjaano API is running"}
 
-# News API configuration
-# Set your NewsAPI key as an environment variable: NEWS_API_KEY
-# Or replace with your API key directly (not recommended for production)
+# News API config
 NEWS_API_KEY = os.getenv("NEWS_API_KEY", "YOUR_NEWS_API_KEY_HERE")
 NEWS_API_URL = "https://newsapi.org/v2/top-headlines"
 
 @app.get("/news")
 async def get_news(
-    category: str = Query("general", description="News category"),
-    country: str = Query("us", description="Country code"),
-    api_key: str | None = Query(
-        default=None,
-        description="Optional NewsAPI key override",
-        alias="apiKey"
-    )
+    category: str = Query("general"),
+    country: str = Query("us"),
+    api_key: str | None = Query(default=None, alias="apiKey")
 ):
-    """
-    Fetch news articles from NewsAPI.
-    Categories: general, business, entertainment, health, science, sports, technology
-    Countries: us, in, gb, ca, au, etc.
-    """
     key_to_use = api_key or NEWS_API_KEY
-
     if key_to_use == "YOUR_NEWS_API_KEY_HERE" or not key_to_use:
-        raise HTTPException(
-            status_code=500,
-            detail="News API key not configured. Please set NEWS_API_KEY environment variable."
-        )
-    
+        raise HTTPException(status_code=500, detail="News API key not configured. Set NEWS_API_KEY env var.")
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get(
                 NEWS_API_URL,
-                params={
-                    "country": country,
-                    "category": category,
-                    "apiKey": key_to_use,
-                    "pageSize": 20
-                },
+                params={"country": country, "category": category, "apiKey": key_to_use, "pageSize": 20},
                 timeout=10.0
             )
-            
             if response.status_code != 200:
-                error_data = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
-                raise HTTPException(
-                    status_code=response.status_code,
-                    detail=error_data.get("message", f"Failed to fetch news: {response.status_code}")
-                )
-            
+                data = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
+                raise HTTPException(status_code=response.status_code, detail=data.get("message", "News API error"))
             data = response.json()
-            
             if data.get("status") == "ok":
-                # Filter out removed articles
-                articles = [article for article in data.get("articles", []) if article.get("title") != "[Removed]"]
-                return {
-                    "status": "ok",
-                    "totalResults": len(articles),
-                    "articles": articles
-                }
+                articles = [a for a in data.get("articles", []) if a.get("title") != "[Removed]"]
+                return {"status": "ok", "totalResults": len(articles), "articles": articles}
             else:
-                raise HTTPException(
-                    status_code=500,
-                    detail=data.get("message", "Failed to fetch news")
-                )
-                
+                raise HTTPException(status_code=500, detail=data.get("message", "Failed to fetch news"))
     except httpx.TimeoutException:
         raise HTTPException(status_code=504, detail="Request to news API timed out")
     except httpx.RequestError as e:
-        raise HTTPException(status_code=502, detail=f"Error connecting to news API: {str(e)}")
+        raise HTTPException(status_code=502, detail=f"Error connecting to news API: {e}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error fetching news: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error fetching news: {e}")
 
+# ---------- Prediction endpoint ----------
 @app.post("/predict")
 def predict(req: RequestModel):
     try:
-        # The model is a pipeline, so it should handle the text directly
-        prediction = model.predict([req.text])[0]
+        # Use pipeline predict (works for plain estimator too)
+        raw_pred = model.predict([req.text])
+        if isinstance(raw_pred, (list, tuple, np.ndarray)):
+            prediction = raw_pred[0]
+        else:
+            prediction = raw_pred
 
-        # LinearSVC does NOT support probabilities, but we can use decision_function
-        # decision_function returns signed distance to hyperplane
-        # We'll convert it to a confidence score (0-1 range) using sigmoid
-        confidence = None
-        if hasattr(model, "decision_function"):
+        # Prepare label and label_name safely
+        label_name = None
+        label_value = None
+
+        # If prediction is string (e.g., 'fake'/'real'), return directly
+        if isinstance(prediction, str):
+            label_name = prediction
+            label_value = prediction
+        else:
+            # Try numeric conversion
             try:
-                margin = model.decision_function([req.text])[0]
-                if hasattr(margin, "__len__"):
-                    margin = float(max(margin))
-                else:
-                    margin = float(margin)
-                
-                # Convert decision function to confidence score using sigmoid
-                # This ensures confidence is always between 0 and 1
-                # The absolute value ensures high confidence regardless of class
-                confidence = 1.0 / (1.0 + np.exp(-abs(margin)))
-            except Exception as e:
-                print(f"Error calculating confidence: {e}")
-                confidence = None
+                label_value = int(prediction)
+                label_name = LABEL_NAMES.get(label_value, str(prediction))
+            except Exception:
+                # fallback to stringified prediction
+                label_value = str(prediction)
+                label_name = str(prediction)
 
-        # Get the class name for the prediction
-        # Convert prediction to int in case it's a numpy type
-        prediction_int = int(prediction)
-        label_name = LABEL_NAMES.get(prediction_int, f"Unknown ({prediction})")
-        
-        return {
-            "label": str(prediction),
-            "label_name": label_name,
-            "confidence": confidence
-        }
+        # Confidence calculation: prefer model.decision_function if available,
+        # otherwise try classifier.decision_function
+        confidence = None
+        try:
+            if hasattr(model, "decision_function"):
+                margin = model.decision_function([req.text])[0]
+            elif classifier is not None and hasattr(classifier, "decision_function"):
+                margin = classifier.decision_function([req.text])[0]
+            else:
+                margin = None
+
+            if margin is not None:
+                # margin can be scalar or array -> use max element for multiclass
+                if hasattr(margin, "__len__"):
+                    margin_val = float(max(np.abs(margin)))
+                else:
+                    margin_val = float(abs(margin))
+                confidence = 1.0 / (1.0 + np.exp(-margin_val))
+        except Exception as e:
+            logger.debug("Confidence calculation failed: %s", e)
+            confidence = None
+
+        return {"label": label_value, "label_name": label_name, "confidence": confidence}
     except Exception as e:
-        error_details = traceback.format_exc()
-        print(f"Error in predict: {e}")
-        print(error_details)
-        # Return error with CORS headers
+        logger.exception("Prediction error")
         return JSONResponse(
             status_code=500,
             content={"detail": f"Prediction error: {str(e)}", "error_type": type(e).__name__},
@@ -191,5 +195,12 @@ def predict(req: RequestModel):
                 "Access-Control-Allow-Origin": "*",
                 "Access-Control-Allow-Methods": "*",
                 "Access-Control-Allow-Headers": "*",
-            }
+            },
         )
+
+# Optional local run (keeps compatibility for local dev)
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    # For local testing only; Render should use its Start Command
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
