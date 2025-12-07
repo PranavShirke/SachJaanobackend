@@ -99,7 +99,7 @@ def root():
     return {"message": "Sachjaano API is running"}
 
 # News API config
-NEWS_API_KEY = os.getenv("NEWS_API_KEY", "YOUR_NEWS_API_KEY_HERE")
+NEWS_API_KEY = os.getenv("NEWS_API_KEY", "22fd7847be494e6c97f3ce98a5ca6228")
 NEWS_API_URL = "https://newsapi.org/v2/top-headlines"
 
 @app.get("/news")
@@ -109,7 +109,8 @@ async def get_news(
     api_key: str | None = Query(default=None, alias="apiKey")
 ):
     key_to_use = api_key or NEWS_API_KEY
-    if key_to_use == "YOUR_NEWS_API_KEY_HERE" or not key_to_use:
+    # Only fail if key is missing or is the placeholder
+    if not key_to_use or key_to_use == "YOUR_NEWS_API_KEY_HERE":
         raise HTTPException(status_code=500, detail="News API key not configured. Set NEWS_API_KEY env var.")
     try:
         async with httpx.AsyncClient() as client:
